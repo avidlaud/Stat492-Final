@@ -1,0 +1,250 @@
+---
+title: "Final"
+author: "David Lau"
+date: "5/3/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(lubridate)
+library(tidyverse)
+library(jsonlite)
+library(leaflet)
+library(yaImpute)
+```
+
+# Project Overview
+
+In this notebook, I plan to wrangle some data regarding transportation options within New York City, particularly the subway and Uber ridesharing. In general, the subway is a far more economical option, costing only $2.75 ($2.50 in 2014 - the year in which the data was collected) as opposed to Uber rides, which have a minimum fare of $7.00 (https://www.investopedia.com/articles/personal-finance/021015/uber-versus-yellow-cabs-new-york-city.asp)
+
+# Datasets
+
+## Uber Data
+
+I will be using the "Uber Pickups in New York City" dataset: https://www.kaggle.com/fivethirtyeight/uber-pickups-in-new-york-city
+
+This dataset is fairly limited and only contains the latitude and longitude of the pickup location. Unfortunately, there is no data regarding the distance of the ride nor the dropout location, but the pickup location is sufficient for some meaningful analysis.
+
+## MTA Data
+
+Additionally, I will use a wrapper of the MTA API to gather information about each subway station: http://nycpulse.herokuapp.com/api
+
+Particularly, I will use their `/stop` endpoint, which returns the name, latitude, and longitude of the subway station.
+
+# Processing Data
+
+## Uber Dataset
+
+First, I will analyze the dataset of Uber rides. I will be using the raw data from 2014, which is split up into six files. 
+
+```{r openuber}
+uber_apr <- read_csv(here("data", "uber-raw-data-apr14.csv"))
+uber_may <- read_csv(here("data", "uber-raw-data-may14.csv"))
+uber_jun <- read_csv(here("data", "uber-raw-data-jun14.csv"))
+uber_jul <- read_csv(here("data", "uber-raw-data-jul14.csv"))
+uber_aug <- read_csv(here("data", "uber-raw-data-aug14.csv"))
+uber_sep <- read_csv(here("data", "uber-raw-data-sep14.csv"))
+
+uber_data <- rbind(uber_apr, uber_may, uber_jun, uber_jul, uber_aug, uber_sep)
+
+dim(uber_data)
+
+uber_data %>% head(10)
+```
+
+There are approximately 4.5 million samples in total.
+
+First, I'll parse the dates and times. Finally, I'll rename the columns to prepare them for plotting later.
+
+```{r parseUberDate}
+uber_data <- uber_data %>%
+  mutate(`Date/Time` = mdy_hms(`Date/Time`, tz = "America/New_York"))
+
+uber_data <- uber_data %>% rename(lat=Lat, lng=Lon)
+
+uber_data %>% head(10)
+```
+
+## MTA Dataset
+
+The MTA data is a bit more split up and will require many API calls to gather. First, I will grab the list of stations from the API and then use that list to make requests for the location of each station. This operation takes quite a while since there are 985 stations.
+
+```{r mtadata}
+station_list_url <- "https://mtaapi.herokuapp.com/stations"
+station_list <- station_list_url %>% fromJSON()
+
+station_list <- data.frame(station_list)
+station_list <- station_list %>%
+  rename('StationId' = 'result.id', 'StationName' = 'result.name')
+
+getStationLatLong <- function(stationId) {
+  url <- paste0("https://mtaapi.herokuapp.com/stop?id=", stationId)
+  url %>% fromJSON() %>% .[["result"]]
+}
+
+station_list <- station_list %>%
+  rowwise() %>%
+  mutate(`lat` = as.numeric(getStationLatLong(StationId) %>% .[["lat"]]), `lng` = as.numeric(getStationLatLong(StationId) %>% .[["lon"]]))
+
+station_list
+
+```
+
+Earlier, I mentioned that the list of stations returned by the API had 985 entries. This seems a bit high. A quick Google search indicates that there are ~470 stations. Taking a look at the data, it appears that some entries are duplicated if they have both north and south bound lines at the same station. For our purposes, we won't need both. Hence, I will remove duplicate entries that have the same name and location.
+
+```{r uniqueMTA}
+unique_station_list = unique(station_list[ , 2:4])
+unique_station_list <- as.data.frame(unique_station_list)
+unique_station_list <- unique_station_list %>%
+  mutate(station_row = row_number())
+nrow(unique_station_list)
+unique_station_list %>% head(10)
+```
+
+# Inspecting Data
+
+## Uber Dataset
+
+First, I will plot the locations of uber pickups. The dataset is quite large, at ~4.5 million rows. As a result, I encountered issues with plotting all of the points. Hence, I generated a random sample of 50,000 entries to be able to visualize the data.
+
+```{r plotUber}
+Uber_sample = sample_n(uber_data, 50000)
+
+Uber_map <- leaflet(Uber_sample) %>%
+  addTiles() %>%
+  addMarkers(~lng, ~lat, clusterOptions = markerClusterOptions())
+Uber_map
+```
+
+Evidently, there are data points that are outside of the zones that the subway covers. This is a bit tricky to cover, since efficiently determining the location for 4.5 million samples is difficult. One solution I had in mind was to use an API to get the state and city of the the coordinate, but this would be slow and take many API credits. As a result, I decided to try another solution. There are ways of using spatial data to determine the state locally with the `sp` package. However, after trying this method, I was left with poor results as running this on a mere subset of 50k samples took nearly half an hour. As a result, I determined that I needed a much quicker method that could approximate the borders. I ended up using a basic filter to only include points within the farthest bounds of NYC. While this still resulted in some points from outside the area, I concluded that this was a best I could get based on how large the dataset is and how difficult it would be to process all of the data. Filtering in this manner removed about 86k samples.
+
+### Filtering Data
+
+```{r filterUber}
+# Filter approximate NYC border
+uber_filtered <- uber_data %>%
+  filter(between(lng, -74.04181, -73.7), between(lat, 40.543, 40.914))
+
+uber_filtered %>% head(20)
+```
+
+## MTA Dataset
+
+```{r plotMTA}
+MTA_map <- leaflet(unique_station_list) %>%
+  addTiles() %>%
+  addCircleMarkers(~lng, ~lat)
+MTA_map
+```
+
+# Computation
+
+First, I need to determine the subway station that is closest to the pickup point for the Uber ride. I originally planned to do this manually, by applying the Pythagorean theorem and calculating the distance using the latitude and longitude. While this would be easy to implement, the operation would take quite a bit of time since it would have to calculate the distance 4.5 million * 490 times. Luckily, I noticed that this process is very similar to K Nearest Neighbors. Hence, I utilized the yaImpute library, which has the useful `ann` function to quickly calculate the nearest neighbor.
+
+```{r uberDistance, results=FALSE}
+distance_from_station = ann(as.matrix(unique_station_list[, 2:3]), as.matrix(uber_filtered[, 2:3]))
+```
+
+Now, the output contains the row index of the nearest station, along with the distance in terms of latitude/longitude. I will use this to perform a left join with the station list.
+
+```{r showUberDistance}
+uber_station_dist <- distance_from_station$knnIndexDist
+uber_station_dist_df <- as.data.frame(uber_station_dist)
+uber_station_dist_df <- uber_station_dist_df %>%
+  rename('station_row'='V1', 'Distance'='V2')
+uber_station <- uber_station_dist_df %>%
+  left_join(unique_station_list, by='station_row')
+uber_station <- uber_station %>%
+  rename('StationLat'='lat', 'StationLng'='lng')
+uber_station['UberLat'] = uber_filtered['lat']
+uber_station['UberLng'] = uber_filtered['lng']
+uber_station['Date'] = uber_filtered['Date/Time']
+uber_station %>% head(20)
+```
+
+Now that I have all of the data I want, I will make some basic plots to identify some key statistics.
+
+### Top Stations
+```{r stationStats}
+most_popular_stations <- uber_station %>% count(station_row, sort=TRUE)
+most_popular_stations <- most_popular_stations %>%
+  left_join(unique_station_list, by='station_row')
+most_popular_stations %>% head(10)
+
+most_popular_stations %>% head(10) %>%
+  ggplot(aes(reorder(StationName, n), n)) +
+  geom_bar(stat='identity') + 
+  coord_flip() + 
+  ggtitle("Closest Station to Uber Pickup Location") +
+  xlab("Station Name") + 
+  ylab("Uber Pickups")
+```
+
+### Stations with Shortest Average Distance
+
+We can also look at what stations had the average closest pickup distance
+
+```{r closestStation}
+closest_stations <- uber_station %>%
+  group_by(StationName) %>%
+  summarize(average_dist = mean(Distance)) %>%
+  arrange(average_dist)
+closest_stations %>% head(10)
+```
+
+### Date and Time
+
+```{r uberTime}
+uber_station_time <- uber_station %>%
+  mutate(`Day` = as.Date(`Date`, format="%Y-%m-%d"), `Time` = format(`Date`, format="%H:%M:%S")) %>%
+  mutate(`Time` = as.POSIXct(strptime(`Time`, format="%H:%M:%S")))
+
+uber_station_time %>% head(10)
+
+uber_station_time %>%
+  group_by(`Time`) %>%
+  summarize(n()) %>%
+  ggplot(aes(`Time`, `n()`)) +
+  geom_point() +
+  scale_x_datetime(labels = function(x) format(x, format = "%H:%M")) +
+  ylab("Rides") + 
+  ggtitle("Number of Rides Throughout the Day")
+```
+
+### Weather
+
+One suggestion was to incorporate weather, which I thought was an excellent idea. I gathered weather data from https://www.ncdc.noaa.gov/cdo-web/, which allows you to "order" a dataset for free. I used their tool to get weather data from Central Park from 01-01-2014 to 12-31-2014. This dataset contains metrics about temperature as well as precipitation.
+
+```{r weatherLoad}
+weather_raw <- read_csv(here("data", "weather.csv"))
+```
+
+```{r weatherTransform}
+weather <- weather_raw %>%
+  select(`DATE`, `PRCP`, `TMAX`) %>%
+  rename(`Day`=`DATE`, `Rain`=`PRCP`, `Temperature`=`TMAX`)
+
+weather %>% head(10)
+
+```
+
+```{r uberWeather}
+uber_station_weather <- uber_station_time %>%
+  left_join(weather, by='Day')
+
+# Get relative frequency for weather
+weather_temp_dist <- weather %>%
+  group_by(`Temperature`) %>%
+  summarize(`Freq` = n())
+  
+uber_station_weather %>%
+  group_by(`Temperature`) %>%
+  summarize(n()) %>%
+  left_join(weather_temp_dist, by='Temperature') %>%
+  mutate(`Average Per Day` = `n()` / `Freq`) %>%
+  ggplot(aes(`Temperature`, `Average Per Day`)) +
+  geom_point() +
+  geom_smooth()
+```

@@ -164,10 +164,16 @@ uber_station <- uber_station %>%
 uber_station['UberLat'] = uber_filtered['lat']
 uber_station['UberLng'] = uber_filtered['lng']
 uber_station['Date'] = uber_filtered['Date/Time']
-uber_station %>% head(20)
+uber_station %>% head(10)
 ```
-One aspect I thought would be cool to visualize is the grouping of closest station. Here, the map is limited by the fact that the color choices were limited and there was an overlap options - that is, multiple stations had the same color, even sometimes ones that were right next to each other. As a result, this map did not turn out as well as I had hoped, but still is interesting to look at. The locations of the stations are also plotted.
 
+Since this is an appropriate combination of the two datasets, I will save the dataframe as a csv for others to use.
+
+```{r outputDataframe}
+uber_station %>% write_csv(here("data", "wrangledData.csv"))
+```
+
+One aspect I thought would be cool to visualize is the grouping of closest station. Here, the map is limited by the fact that the color choices were limited and there was an overlap options - that is, multiple stations had the same color, even sometimes ones that were right next to each other. As a result, this map did not turn out as well as I had hoped, but still is interesting to look at. The locations of the stations are also plotted.
 
 ```{r closestStations}
 uber_station_sample = sample_n(uber_station, 40000)
